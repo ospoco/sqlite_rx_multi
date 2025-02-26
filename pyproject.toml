@@ -62,6 +62,7 @@ cli = [
 [project.scripts]
 sqlite-server = "sqlite_rx.cli.server:main"
 sqlite-client = "sqlite_rx.cli.client:main"
+sqlite-multi-server = "sqlite_rx.cli.multiserver:main"
 
 [tool.setuptools]
 zip-safe = false
@@ -87,6 +88,7 @@ source = ["sqlite_rx"]
 dev = [
     "build>=1.2.2.post1",
     "coverage>=7.6.1",
+    "files-to-prompt>=0.6",
     "hatchling>=1.27.0",
     "pip>=25.0.1",
     "pytest>=8.3.4",

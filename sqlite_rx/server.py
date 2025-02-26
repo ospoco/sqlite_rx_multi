@@ -7,7 +7,8 @@ import sys
 import threading
 import traceback
 import zlib
-from signal import SIGTERM, SIGINT, signal
+import time
+import signal as signal_module 
 
 from typing import List, Union, Callable
 
@@ -97,7 +98,19 @@ class SQLiteZMQProcess(multiprocessing.Process):
                 self.auth = AsyncioAuthenticator(self.context)
                 LOG.info("ZAP enabled. \n Authorizing clients in %s.", keymonkey.authorized_clients_dir)
                 self.auth.configure_curve(domain="*", location=keymonkey.authorized_clients_dir)
+                
+                # Set a timeout for ZAP authenticator start
+                start_timeout = time.time() + 5  # 5 second timeout
                 self.auth.start()
+                
+                # Wait for ZAP socket to be ready
+                while time.time() < start_timeout:
+                    if getattr(self.auth, "_zap_socket", None):
+                        LOG.info("ZAP authenticator started successfully")
+                        break
+                    time.sleep(0.1)
+                else:
+                    LOG.warning("ZAP authenticator might not have started properly")
 
         self.socket.bind(address)
 
@@ -110,29 +123,20 @@ class SQLiteZMQProcess(multiprocessing.Process):
 class SQLiteServer(SQLiteZMQProcess):
 
     def __init__(self,
-                 bind_address: str,
-                 database: Union[bytes, str],
-                 auth_config: dict = None,
-                 curve_dir: str = None,
-                 server_curve_id: str = None,
-                 use_encryption: bool = False,
-                 use_zap_auth: bool = False,
-                 backup_database: Union[bytes, str] = None,
-                 backup_interval: int = 4,
-                 *args, **kwargs):
+                bind_address: str,
+                database: Union[bytes, str],
+                auth_config: dict = None,
+                curve_dir: str = None,
+                server_curve_id: str = None,
+                use_encryption: bool = False,
+                use_zap_auth: bool = False,
+                backup_database: Union[bytes, str] = None,
+                backup_interval: int = 4,
+                *args, **kwargs):
         """
         SQLiteServer runs as an isolated python process.
-
-        Args:
-            bind_address : The address and port on which the server will listen for client requests.
-            database: A path like object or the string ":memory:" for in-memory database.
-            context: The ZMQ context
-            auth_config : A dictionary describing what actions are authorized, denied or ignored.
-            use_encryption : True means use `CurveZMQ` encryption. False means don't
-            use_zap_auth : True means use `ZAP` authentication. False means don't
-
         """
-        super(SQLiteServer, self).__init__(*args, *kwargs)
+        super(SQLiteServer, self).__init__(*args, **kwargs)
         self._bind_address = bind_address
         self._database = database
         self._auth_config = auth_config
@@ -142,6 +146,9 @@ class SQLiteServer(SQLiteZMQProcess):
         self.curve_dir = curve_dir
         self.rep_stream = None
         self.back_up_recurring_thread = None
+        # Store backup parameters as instance variables
+        self._backup_database = backup_database
+        self._backup_interval = backup_interval
 
         if backup_database is not None:
             if not is_backup_supported():
@@ -151,12 +158,24 @@ class SQLiteServer(SQLiteZMQProcess):
             self.back_up_recurring_thread = RecurringTimer(function=sqlite_backup, interval=backup_interval)
             self.back_up_recurring_thread.daemon = True
 
+        self._own_context = kwargs.pop('own_context', True)
+        if self._own_context:
+            self.context = zmq.Context.instance()
+        else:
+            self.context = None  # Will be set in setup()
+
     def setup(self):
         """
         Start a zmq.REP socket stream and register a callback :class: `sqlite_rx.server.QueryStreamHandler`
 
         """
+        LOG.info("Python Platform %s", platform.python_implementation())
+        LOG.info("libzmq version %s", zmq.zmq_version())
+        LOG.info("pyzmq version %s", zmq.__version__)
         super().setup()
+        # Use provided context or create new one
+        if not self.context:
+            self.context = zmq.Context.instance()
         # Depending on the initialization parameters either get a plain stream or secure stream.
         self.rep_stream = self.stream(zmq.REP,
                                       self._bind_address,
@@ -172,33 +191,120 @@ class SQLiteServer(SQLiteZMQProcess):
     def handle_signal(self, signum, frame):
         LOG.info("SQLiteServer %s PID %s received %r", self, self.pid, signum)
         LOG.info("SQLiteServer Shutting down")
-
-        self.rep_stream.close()
-        self.socket.close()
-        self.loop.stop()
-        
-        if self.back_up_recurring_thread:
-            self.back_up_recurring_thread.cancel()
+        if hasattr(self, 'rep_stream') and self.rep_stream:
+                self.rep_stream.close()
+        if hasattr(self, 'socket') and self.socket:
+            self.socket.close()
+        if hasattr(self, 'loop') and self.loop:
+            self.loop.stop()
+        if hasattr(self, 'back_up_recurring_thread') and self.back_up_recurring_thread:
+            try:
+                self.back_up_recurring_thread.cancel()
+            except:
+                pass
+        # Stop ZAP authenticator if running
+        if hasattr(self, 'auth') and self.auth:
+            try:
+                self.auth.stop()
+                LOG.info("ZAP authenticator stopped")
+            except Exception as e:
+                LOG.warning(f"Error stopping ZAP authenticator: {e}")
         raise SystemExit()
 
     def run(self):
-        LOG.info("Setting up signal handlers")
-
-        signal(SIGTERM, self.handle_signal)
-        signal(SIGINT, self.handle_signal)
-
+        """Main server process that handles client requests."""
+        # Set up signal handlers for graceful shutdown
+        signal_module.signal(signal_module.SIGTERM, self.handle_signal)
+        signal_module.signal(signal_module.SIGINT, self.handle_signal)
+        
+        # Set up server's request-response socket
         self.setup()
-
-        LOG.info("SQLiteServer version %s", get_version())
-        LOG.info("SQLiteServer (Tornado) i/o loop started..")
+        
+        LOG.info("SQLiteServer %s PID %s running", self, self.pid)
         LOG.info("Backup thread %s", self.back_up_recurring_thread)
+        
+        # If the server has a backup thread, ensure it's running
+        if hasattr(self, '_backup_database') and self._backup_database and self.back_up_recurring_thread:
+            try:
+                if not self.back_up_recurring_thread.is_alive():
+                    self.back_up_recurring_thread.start()
+            except RuntimeError as e:
+                LOG.warning("Could not start backup thread: %s", e)
+                
+                # If the thread is already started, create a new one
+                if "thread already started" in str(e):
+                    # Cancel the existing thread
+                    try:
+                        self.back_up_recurring_thread.cancel()
+                    except Exception as cancel_error:
+                        LOG.warning("Error canceling backup thread: %s", cancel_error)
+                    
+                    # Create a completely new backup thread with the same parameters
+                    sqlite_backup = SQLiteBackUp(src=self._database, target=self._backup_database)
+                    new_thread = RecurringTimer(
+                        function=sqlite_backup, 
+                        interval=self._backup_interval
+                    )
+                    new_thread.daemon = True
+                    
+                    # Store the new thread and start it
+                    self.back_up_recurring_thread = new_thread
+                    try:
+                        self.back_up_recurring_thread.start()
+                        LOG.info("Successfully created and started new backup thread")
+                    except Exception as start_error:
+                        LOG.error("Failed to start new backup thread: %s", start_error)
+        
+        # Main server loop - handled by the REP socket event loop
+        try:
+            self.loop.start()
+        except KeyboardInterrupt:
+            LOG.info("Caught keyboard interrupt, exiting")
+        except Exception as e:
+            LOG.exception("Unexpected error in server main loop: %s", e)
+        finally:
+            self.cleanup()
 
-        if self.back_up_recurring_thread and not self.back_up_recurring_thread.is_alive():
-            self.back_up_recurring_thread.start()
+    def cleanup(self):
+        """Clean up resources before shutdown."""
+        LOG.info("Cleaning up SQLiteServer resources")
+        if hasattr(self, 'back_up_recurring_thread') and self.back_up_recurring_thread:
+            try:
+                self.back_up_recurring_thread.cancel()
+                LOG.info("Backup thread canceled")
+            except Exception as e:
+                LOG.warning("Error canceling backup thread: %s", e)
+        
+        if hasattr(self, 'rep_stream') and self.rep_stream:
+            try:
+                self.rep_stream.close()
+                LOG.info("REP stream closed")
+            except Exception as e:
+                LOG.warning("Error closing REP stream: %s", e)
+        
+        if hasattr(self, 'socket') and self.socket:
+            try:
+                self.socket.close(linger=0)
+                LOG.info("Socket closed")
+            except Exception as e:
+                LOG.warning("Error closing socket: %s", e)
+                
+        if hasattr(self, 'loop') and self.loop:
+            try:
+                self.loop.stop()
+                LOG.info("Event loop stopped")
+            except Exception as e:
+                LOG.warning("Error stopping event loop: %s", e)
 
-        LOG.info("Ready to accept client connections on %s", self._bind_address)
-        self.loop.start()
-
+        # If we own the context, terminate it
+        if self._own_context and hasattr(self, 'context') and self.context:
+            try:
+                # Only terminate if not the default context
+                if id(self.context) != id(zmq.Context.instance()):
+                    self.context.term()
+                LOG.debug("ZMQ context terminated")
+            except Exception as e:
+                LOG.warning("Error terminating ZMQ context: %s", e)
 
 class QueryStreamHandler:
 
@@ -255,7 +361,9 @@ class QueryStreamHandler:
                 self._cursor.executemany(message['query'], message['params'])
             elif message['params']:
                 LOG.debug("Query Mode: Conditional Params")
-                self._cursor.execute(message['query'], message['params'])
+                # Convert list to tuple if it's not already a tuple
+                params = tuple(message['params']) if isinstance(message['params'], list) else message['params']
+                self._cursor.execute(message['query'], params)
             else:
                 LOG.debug("Query Mode: Default No params")
                 self._cursor.execute(message['query'])

@@ -1,5 +1,6 @@
 .venv
 *.pyc
+*.cxml
 .idea
 sqlite_rx.egg-info/
 cover/
