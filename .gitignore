@@ -2,6 +2,8 @@
 *.pyc
 *.cxml
 .idea
+.python-version
+.DS_Store
 sqlite_rx.egg-info/
 cover/
 build/
