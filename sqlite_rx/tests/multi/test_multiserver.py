@@ -45,6 +45,9 @@ def multi_db_client():
         )
         server.start()
         LOG.info("Started Test SQLiteMultiServer")
+        # Call health check directly instead of through the client
+        status = server.get_health_info()
+        print(f"Server status: {status}")
 
         # Create clients for each database
         clients = {

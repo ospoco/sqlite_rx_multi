@@ -163,8 +163,8 @@ def test_multiserver_health_check():
         updated_test = test_client.execute("HEALTH_CHECK")
         
         # Verify query counts increased
-        assert updated_default["query_count"] > 0
-        assert updated_test["query_count"] > 0
+        assert updated_default["metrics"]["query_count"] > 0
+        assert updated_test["metrics"]["query_count"] > 0
         
         # Clean up
         default_client.cleanup()

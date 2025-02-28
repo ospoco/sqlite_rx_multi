@@ -5,7 +5,9 @@ import socket
 import time
 import uuid
 import platform
-from typing import Dict, List, Union, Optional
+import collections
+import re
+from typing import Dict, List, Union, Optional, OrderedDict, Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -17,9 +19,14 @@ from . import get_version
 from .auth import KeyMonkey
 from .exception import SQLiteRxZAPSetupError
 from .server import SQLiteServer
+from .monitor import ProcessMonitor
 from .utils.path_utils import resolve_database_path
 
 LOG = logging.getLogger(__name__)
+try:
+    import psutil
+except (ImportError, ModuleNotFoundError):
+    psutil = None
 
 class DatabaseProcess:
     """Represents a database process with its configuration and control info."""
@@ -154,6 +161,13 @@ class SQLiteMultiServer(multiprocessing.Process):
                 backup_interval: int = 600,
                 base_port: int = 6000,
                 data_directory: Union[str, Path] = None,
+                auto_connect: bool = False,
+                auto_create: bool = False,
+                max_connections: int = 20,
+                enable_monitoring: bool = True,
+                resource_monitoring: bool = True,
+                log_directory: str = None,
+                notification_callback: Callable = None,
                 *args, **kwargs):
         """
         SQLiteMultiServer starts separate processes for each database.
@@ -171,6 +185,13 @@ class SQLiteMultiServer(multiprocessing.Process):
             backup_interval: Backup interval in seconds
             base_port: Starting port for database processes
             data_directory: Base directory for database files (if relative paths are used)
+            auto_connect: Whether to automatically connect to existing databases
+            auto_create: Whether to automatically create new databases
+            max_connections: Maximum number of dynamic database connections to maintain
+            enable_monitoring: Whether to enable process monitoring
+            resource_monitoring: Whether to enable resource usage monitoring
+            log_directory: Directory to store log files
+            notification_callback: Function to call for alerts (takes name, type, message)
         """
         super(SQLiteMultiServer, self).__init__(*args, **kwargs)
         self._bind_address = bind_address
@@ -194,6 +215,17 @@ class SQLiteMultiServer(multiprocessing.Process):
         self.backup_interval = backup_interval
         self.base_port = base_port
         
+        # Auto-connection settings
+        self._auto_connect = auto_connect
+        self._auto_create = auto_create
+        self._max_connections = max_connections
+        
+        # Monitoring settings
+        self._enable_monitoring = enable_monitoring
+        self._resource_monitoring = resource_monitoring
+        self._log_directory = log_directory
+        self._notification_callback = notification_callback
+        
         # Will be initialized in setup()
         self.context = None
         self.router_socket = None
@@ -201,6 +233,12 @@ class SQLiteMultiServer(multiprocessing.Process):
         self.identity_db_map = {}
         self.poller = None
         self.running = False
+        self.process_monitor = None
+        
+        # LRU Cache for dynamic database processes
+        # OrderedDict naturally maintains insertion order which we'll use for LRU
+        self._dynamic_processes = collections.OrderedDict()
+        self._next_dynamic_port = None  # Will be set in setup
         
         # Initialize health metrics
         self._start_time = time.time()
@@ -209,6 +247,8 @@ class SQLiteMultiServer(multiprocessing.Process):
             "error_count": 0,
             "last_query_time": 0,
             "total_process_restarts": 0,
+            "dynamic_connections_created": 0,
+            "dynamic_connections_evicted": 0,
         }
         self.name = kwargs.pop('name', f"SQLiteMultiServer-{os.getpid()}")
         
@@ -234,6 +274,9 @@ class SQLiteMultiServer(multiprocessing.Process):
         )
         self.database_processes[""] = default_process
         
+        # Keep track of the highest port used
+        highest_port = self.base_port
+        
         # Now set up each named database
         port = self.base_port + 1
         for db_name, db_path in self._database_map_orig.items():  # Use original paths
@@ -255,18 +298,53 @@ class SQLiteMultiServer(multiprocessing.Process):
                 data_directory=self._data_directory  # Pass data_directory
             )
             self.database_processes[db_name] = db_process
+            highest_port = port
             port += 1
+        
+        # Set the next port for dynamic databases
+        self._next_dynamic_port = highest_port + 1
             
     def start_database_processes(self):
         """Start all database processes."""
         for db_name, db_process in self.database_processes.items():
             db_process.start()
+            
+            # Register with process monitor if enabled
+            if self.process_monitor:
+                self.process_monitor.register_process(
+                    f"db-{db_name}" if db_name else "db-default", 
+                    db_process.process
+                )
             # Give a short delay between process starts to avoid port conflicts
-            time.sleep(0.2)
+            time.sleep(0.1)
+            
+        ready = self.wait_for_databases_ready()
+        if not ready:
+            LOG.error("Failed to start all database processes")
+            raise RuntimeError("Failed to start all database processes")
+
+    def wait_for_databases_ready(self, timeout=10):
+        """Wait until all database processes are running and responding."""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            all_ready = True
+            for db_name, db_process in self.database_processes.items():
+                if not db_process.is_running():
+                    all_ready = False
+                    break
+            if all_ready:
+                return True
+            time.sleep(0.1)
+        return False
             
     def stop_database_processes(self):
-        """Stop all database processes."""
+        """Stop all database processes (both static and dynamic)."""
+        # Stop static database processes
         for db_name, db_process in self.database_processes.items():
+            db_process.stop()
+            
+        # Stop dynamic database processes
+        for db_name, db_process in self._dynamic_processes.items():
             db_process.stop()
             
     def check_database_processes(self):
@@ -314,6 +392,26 @@ class SQLiteMultiServer(multiprocessing.Process):
         
         # Set up dealer sockets to each database process
         self.setup_database_processes()
+        
+        # Initialize process monitor if enabled
+        if self._enable_monitoring:
+            from sqlite_rx.monitor import ProcessMonitor
+            self.process_monitor = ProcessMonitor(check_interval=30)
+            
+            # Configure additional monitor settings
+            if self._resource_monitoring:
+                self.process_monitor.resource_check_interval = 60  # Check resources every minute
+            
+            if self._log_directory:
+                self.process_monitor.log_directory = self._log_directory
+                
+            if callable(self._notification_callback):
+                self.process_monitor.notification_callback = self._notification_callback
+                
+            # Start the monitoring thread
+            self.process_monitor.start_monitoring()
+            LOG.info("Process monitor started")
+        
         self.start_database_processes()
 
     def handle_client_request(self, message_parts):
@@ -353,11 +451,11 @@ class SQLiteMultiServer(multiprocessing.Process):
             self._health_metrics["query_count"] += 1
             self._health_metrics["last_query_time"] = time.time()
             
-            # Check if we have a process for this database
-            if database_name in self.database_processes:
-                db_process = self.database_processes[database_name]
-                
-                # Check for db process health with more detailed logging
+            # Get or create a database process for this request
+            db_process = self._get_or_create_database_process(database_name)
+            
+            if db_process:
+                # Check if the process is running
                 if not db_process.is_running():
                     LOG.warning(f"Database process for '{database_name or 'default'}' is not running, restarting...")
                     
@@ -444,6 +542,154 @@ class SQLiteMultiServer(multiprocessing.Process):
             
             # Update error metrics
             self._health_metrics["error_count"] += 1
+        
+    def _get_dynamic_database_path(self, database_name: str) -> Optional[str]:
+        """
+        Get the path for a dynamic database.
+        
+        Args:
+            database_name: Name of the database
+            
+        Returns:
+            Path to the database file, or None if it doesn't exist or can't be created
+        """
+        if not database_name or not self._data_directory:
+            return None
+        
+        # Validate database name to prevent potential security issues
+        if not self._is_valid_database_name(database_name):
+            LOG.warning(f"Invalid database name requested: {database_name}")
+            return None
+        
+        # Construct the path
+        db_path = os.path.join(self._data_directory, f"{database_name}.db")
+        
+        # Check if database exists (for auto_connect)
+        if os.path.exists(db_path):
+            return db_path
+        
+        # If it doesn't exist and auto_create is enabled, return the path anyway
+        if self._auto_create:
+            return db_path
+        
+        # Otherwise, return None to indicate we can't use this database
+        return None
+
+    def _is_valid_database_name(self, database_name: str) -> bool:
+        """
+        Check if a database name is valid and safe.
+        
+        Args:
+            database_name: The name to check
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        # Block empty names, names with path separators, or other dangerous characters
+        if not database_name or len(database_name) > 64:
+            return False
+        
+        # Only allow alphanumeric chars, underscore, and hyphen
+        return bool(re.match(r'^[a-zA-Z0-9_-]+$', database_name))
+
+    def _create_dynamic_database_process(self, database_name: str) -> Optional[DatabaseProcess]:
+        """
+        Create a new database process for a dynamically requested database.
+        
+        Args:
+            database_name: Name of the database to create
+        
+        Returns:
+            DatabaseProcess instance or None if creation failed
+        """
+        # Get the database path
+        db_path = self._get_dynamic_database_path(database_name)
+        if not db_path:
+            return None
+        
+        # Create backup path if needed
+        backup_path = None
+        if self.backup_dir:
+            backup_path = os.path.join(self.backup_dir, f"{database_name}_backup.db")
+        
+        # Assign a port
+        port = self._next_dynamic_port
+        self._next_dynamic_port += 1
+        
+        # Create the process
+        db_process = DatabaseProcess(
+            database_name=database_name,
+            database_path=db_path,
+            bind_port=port,
+            auth_config=self._auth_config,
+            use_encryption=self._encrypt,
+            use_zap_auth=self._zap_auth,
+            curve_dir=self.curve_dir,
+            server_curve_id=self.server_curve_id,
+            backup_database=backup_path,
+            backup_interval=self.backup_interval,
+            data_directory=self._data_directory
+        )
+        
+        try:
+            # Start the process
+            db_process.start()
+            LOG.info(f"Created dynamic database process for '{database_name}' on port {port}")
+            
+            # Update metrics
+            self._health_metrics["dynamic_connections_created"] += 1
+            
+            return db_process
+        except Exception as e:
+            LOG.error(f"Failed to create dynamic database process for '{database_name}': {e}")
+            return None
+
+    def _get_or_create_database_process(self, database_name: str) -> Optional[DatabaseProcess]:
+        """
+        Get a database process for the requested database, creating it if necessary.
+        
+        Args:
+            database_name: Name of the database to get or create
+            
+        Returns:
+            DatabaseProcess instance or None if getting/creating failed
+        """
+        # First check configured databases
+        if database_name in self.database_processes:
+            return self.database_processes[database_name]
+        
+        # Return None if auto-connect is disabled
+        if not self._auto_connect:
+            return None
+        
+        # Check if we already have a dynamic process for this database
+        if database_name in self._dynamic_processes:
+            # Move to the end of the OrderedDict to mark as most recently used
+            db_process = self._dynamic_processes.pop(database_name)
+            self._dynamic_processes[database_name] = db_process
+            return db_process
+        
+        # Otherwise, try to create a new process
+        db_process = self._create_dynamic_database_process(database_name)
+        if not db_process:
+            return None
+        
+        # If we've reached the connection limit, evict the least recently used database
+        if len(self._dynamic_processes) >= self._max_connections:
+            # Get the first key (least recently used)
+            oldest_db = next(iter(self._dynamic_processes))
+            oldest_process = self._dynamic_processes.pop(oldest_db)
+            
+            # Stop the process
+            LOG.info(f"Evicting least recently used database '{oldest_db}' to make room for '{database_name}'")
+            oldest_process.stop()
+            
+            # Update metrics
+            self._health_metrics["dynamic_connections_evicted"] += 1
+        
+        # Add the new process to our cache
+        self._dynamic_processes[database_name] = db_process
+        return db_process
 
     def _send_error_response(self, identity, empty_delimiter, error_message):
         """Helper method to send an error response to the client."""
@@ -466,50 +712,141 @@ class SQLiteMultiServer(multiprocessing.Process):
         LOG.info("SQLiteMultiServer Shutting down")
         
         # Stop all database processes
-        self.stop_database_processes()
-        
-        # Close sockets
-        if self.router_socket:
-            self.router_socket.close()
-        
+        self.cleanup()    
         self.running = False
-        
         raise SystemExit()
+    
+    # Helper functions for metrics calculations
+    def _calculate_query_success_rate(self):
+        """Calculate the query success rate as a percentage."""
+        query_count = self._health_metrics.get("query_count", 0)
+        error_count = self._health_metrics.get("error_count", 0)
+        
+        if query_count == 0:
+            return 100.0  # No queries made yet
+        
+        success_rate = ((query_count - error_count) / query_count) * 100
+        return round(success_rate, 2)
+    
+    def _calculate_query_rate(self):
+        """Calculate the average queries per second."""
+        query_count = self._health_metrics.get("query_count", 0)
+        uptime = time.time() - self._start_time
+        
+        if uptime < 1:
+            return 0.0
+        
+        return round(query_count / uptime, 2)
 
-    def get_health_info(self, database_name=''):
+    def get_health_info(self, database_name='', check_system_resources=True):
         """
-        Generate health information for the multi-server.
+        Generate comprehensive health information for the multi-server.
         
         Args:
             database_name: Optional database name to get specific health info
-            
+            check_system_resources: Whether to check system resources
         Returns:
             Dict containing health information
         """
-        from sqlite_rx import get_version
-        
         # Basic health information
         health_info = {
             "status": "healthy",
             "timestamp": time.time(),
-            "uptime": time.time() - self._start_time,
+            "datetime": datetime.now().isoformat(),
+            "uptime_seconds": time.time() - self._start_time,
             "version": get_version(),
             "platform": platform.python_implementation(),
+            "python_version": platform.python_version(),
             "server_type": "SQLiteMultiServer",
             "server_name": self.name,
             "server_pid": self.pid,
             "database_name": database_name,
+        }
+        
+        # Add query metrics
+        health_info["metrics"] = {
             "query_count": self._health_metrics["query_count"],
             "error_count": self._health_metrics["error_count"],
             "last_query_time": self._health_metrics["last_query_time"],
+            "query_success_rate": self._calculate_query_success_rate(),
+            "queries_per_minute": self._calculate_query_rate() * 60,
             "total_process_restarts": self._health_metrics["total_process_restarts"],
+            "dynamic_connections_created": self._health_metrics["dynamic_connections_created"],
+            "dynamic_connections_evicted": self._health_metrics["dynamic_connections_evicted"],
+        }
+        
+        # Add connection info
+        health_info["connection"] = {
+            "auto_connect_enabled": self._auto_connect,
+            "auto_create_enabled": self._auto_create,
+            "max_connections": self._max_connections,
+            "active_dynamic_connections": len(self._dynamic_processes),
+            "router_address": self._bind_address,
+        }
+        
+        # Add security info
+        health_info["security"] = {
+            "encryption_enabled": self._encrypt,
+            "zap_auth_enabled": self._zap_auth,
         }
         
         # Add data directory info
         if self._data_directory:
             health_info["data_directory"] = str(self._data_directory)
+            health_info["storage"] = {
+                "data_directory": str(self._data_directory),
+                "backup_directory": str(self.backup_dir) if self.backup_dir else None,
+                "backup_interval_seconds": self.backup_interval if self.backup_dir else 0,
+            }
+            
+            # Add storage stats if possible
+            if psutil:
+                try:
+                        if os.path.exists(self._data_directory):
+                            disk_usage = psutil.disk_usage(self._data_directory)
+                        health_info["storage"].update({
+                            "disk_total_gb": round(disk_usage.total / (1024**3), 2),
+                            "disk_used_gb": round(disk_usage.used / (1024**3), 2),
+                            "disk_free_gb": round(disk_usage.free / (1024**3), 2),
+                            "disk_percent_used": disk_usage.percent,
+                        })
+                except Exception as e:
+                    health_info["storage"]["disk_stats_error"] = str(e)
         
-        # Get info about all database processes
+        # Add system resource info
+        if psutil:
+            try:
+                # CPU information
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                cpu_count = psutil.cpu_count(logical=True)
+                cpu_count_physical = psutil.cpu_count(logical=False)
+                
+                # Memory information
+                virtual_mem = psutil.virtual_memory()
+                swap_mem = psutil.swap_memory()
+                
+                health_info["system"] = {
+                    "cpu_percent": cpu_percent,
+                    "cpu_count": cpu_count,
+                    "cpu_count_physical": cpu_count_physical,
+                    "load_average": os.getloadavg() if hasattr(os, 'getloadavg') else None,
+                    "memory_total_mb": round(virtual_mem.total / (1024**2), 2),
+                    "memory_available_mb": round(virtual_mem.available / (1024**2), 2),
+                    "memory_used_mb": round(virtual_mem.used / (1024**2), 2),
+                    "memory_percent": virtual_mem.percent,
+                    "swap_total_mb": round(swap_mem.total / (1024**2), 2),
+                    "swap_used_mb": round(swap_mem.used / (1024**2), 2),
+                    "swap_percent": swap_mem.percent,
+                }
+                
+                # Determine if system resources are constrained
+                if check_system_resources and (cpu_percent > 90 or virtual_mem.percent > 90 or swap_mem.percent > 90):
+                    health_info["status"] = "constrained"
+                    health_info["status_reason"] = "System resources running low"
+            except Exception as e:
+                health_info["system_stats_error"] = str(e)
+        
+        # Get info about all static database processes
         processes_info = {}
         for db_name, db_process in self.database_processes.items():
             process_info = {
@@ -517,6 +854,9 @@ class SQLiteMultiServer(multiprocessing.Process):
                 "pid": db_process.process_id if db_process.process_id else None,
                 "port": db_process.bind_port,
                 "address": db_process.bind_address,
+                "database_name": db_name or "default",
+                "type": "static",
+                "uptime_seconds": db_process.get_uptime() if db_process.is_running() else 0,
             }
             
             # Add restart count if available
@@ -530,16 +870,164 @@ class SQLiteMultiServer(multiprocessing.Process):
                     process_info["memory_database"] = True
                 else:
                     process_info["memory_database"] = False
+                    
+                    # Add database size if available
+                    try:
+                        if os.path.exists(str(db_process.database_path)):
+                            size_bytes = os.path.getsize(str(db_process.database_path))
+                            process_info["database_size_bytes"] = size_bytes
+                            process_info["database_size_mb"] = round(size_bytes / (1024**2), 2)
+                    except Exception:
+                        pass
+            
+            # Add backup info
+            if hasattr(db_process, 'backup_database') and db_process.backup_database:
+                process_info["backup"] = {
+                    "enabled": True,
+                    "path": str(db_process.backup_database),
+                    "interval_seconds": db_process.backup_interval,
+                }
+                
+                # Add backup size if available
+                try:
+                    if os.path.exists(str(db_process.backup_database)):
+                        size_bytes = os.path.getsize(str(db_process.backup_database))
+                        process_info["backup"]["size_bytes"] = size_bytes
+                        process_info["backup"]["size_mb"] = round(size_bytes / (1024**2), 2)
+                        process_info["backup"]["last_modified"] = datetime.fromtimestamp(
+                            os.path.getmtime(str(db_process.backup_database))
+                        ).isoformat()
+                except Exception:
+                    pass
+            else:
+                process_info["backup"] = {"enabled": False}
+            
+            # If process is not running, mark health status as degraded
+            if not db_process.is_running():
+                health_info["status"] = "degraded"
+                health_info["status_reason"] = f"Database process '{db_name or 'default'}' is not running"
             
             processes_info[db_name or "default"] = process_info
         
+        # Also include dynamic database processes
+        dynamic_processes_info = {}
+        for db_name, db_process in self._dynamic_processes.items():
+            process_info = {
+                "running": db_process.is_running(),
+                "pid": db_process.process_id if db_process.process_id else None,
+                "port": db_process.bind_port,
+                "address": db_process.bind_address,
+                "database_name": db_name,
+                "type": "dynamic",
+                "uptime_seconds": db_process.get_uptime() if db_process.is_running() else 0,
+            }
+            
+            # Add restart count
+            restart_count = getattr(db_process, 'restart_count', 0)
+            process_info["restart_count"] = restart_count
+            
+            # Add database path
+            if hasattr(db_process, 'database_path'):
+                process_info["database_path"] = str(db_process.database_path)
+                if str(db_process.database_path) == ":memory:":
+                    process_info["memory_database"] = True
+                else:
+                    process_info["memory_database"] = False
+                    
+                    # Add database size if available
+                    try:
+                        if os.path.exists(str(db_process.database_path)):
+                            size_bytes = os.path.getsize(str(db_process.database_path))
+                            process_info["database_size_bytes"] = size_bytes
+                            process_info["database_size_mb"] = round(size_bytes / (1024**2), 2)
+                    except Exception:
+                        pass
+            
+            # Add backup info
+            if hasattr(db_process, 'backup_database') and db_process.backup_database:
+                process_info["backup"] = {
+                    "enabled": True,
+                    "path": str(db_process.backup_database),
+                    "interval_seconds": db_process.backup_interval,
+                }
+                
+                # Add backup size if available
+                try:
+                    if os.path.exists(str(db_process.backup_database)):
+                        size_bytes = os.path.getsize(str(db_process.backup_database))
+                        process_info["backup"]["size_bytes"] = size_bytes
+                        process_info["backup"]["size_mb"] = round(size_bytes / (1024**2), 2)
+                        process_info["backup"]["last_modified"] = datetime.fromtimestamp(
+                            os.path.getmtime(str(db_process.backup_database))
+                        ).isoformat()
+                except Exception:
+                    pass
+            else:
+                process_info["backup"] = {"enabled": False}
+            
+            # If process is not running, mark health status as degraded
+            if not db_process.is_running():
+                health_info["status"] = "degraded"
+                health_info["status_reason"] = f"Dynamic database process '{db_name}' is not running"
+            
+            dynamic_processes_info[db_name] = process_info
+        
         health_info["processes"] = processes_info
-        health_info["database_count"] = len(processes_info)
+        health_info["dynamic_databases"] = dynamic_processes_info
+        health_info["database_count"] = len(processes_info) + len(dynamic_processes_info)
+        
+        # If process monitor is active, include its health stats
+        if hasattr(self, 'process_monitor') and self.process_monitor:
+            try:
+                monitor_info = self.process_monitor.get_process_info()
+                health_info["monitor"] = {
+                    "enabled": True,
+                    "uptime_seconds": monitor_info.get("__stats__", {}).get("uptime", 0),
+                    "total_restarts": monitor_info.get("__stats__", {}).get("total_restarts", 0),
+                    "processes_watched": len(monitor_info) - 1,  # Subtract stats entry
+                }
+                
+                # Check for crashed processes
+                crashed_processes = [
+                    name for name, info in monitor_info.items() 
+                    if name != "__stats__" and info.get("status") == "crash_loop"
+                ]
+                
+                if crashed_processes:
+                    health_info["status"] = "degraded"
+                    health_info["status_reason"] = f"Processes in crash loop: {', '.join(crashed_processes)}"
+                    health_info["monitor"]["crashed_processes"] = crashed_processes
+            except Exception as e:
+                health_info["monitor"] = {
+                    "enabled": True,
+                    "error": str(e)
+                }
+        else:
+            health_info["monitor"] = {"enabled": False}
         
         # Specific information about requested database
         if database_name in self.database_processes:
             db_process = self.database_processes[database_name]
             health_info["database_status"] = "running" if db_process.is_running() else "not_running"
+            health_info["database_type"] = "static"
+            
+            # Add more specific info about the requested database
+            if db_process.is_running():
+                # Add information about this specific database
+                health_info["database_bind_address"] = db_process.bind_address
+                health_info["database_pid"] = db_process.process_id
+                
+                # Backup info
+                if hasattr(db_process, 'backup_database') and db_process.backup_database:
+                    health_info["database_backup_enabled"] = True
+                    health_info["database_backup_path"] = str(db_process.backup_database)
+                    health_info["database_backup_interval"] = db_process.backup_interval
+                else:
+                    health_info["database_backup_enabled"] = False
+        elif database_name in self._dynamic_processes:
+            db_process = self._dynamic_processes[database_name]
+            health_info["database_status"] = "running" if db_process.is_running() else "not_running"
+            health_info["database_type"] = "dynamic"
             
             # Add more specific info about the requested database
             if db_process.is_running():
@@ -586,6 +1074,37 @@ class SQLiteMultiServer(multiprocessing.Process):
                 
                 # Give it time to initialize
                 time.sleep(0.5)
+
+    def cleanup(self):
+        """Clean up resources before shutdown."""
+        LOG.info("Cleaning up MultiServer resources")
+        
+        # Stop the process monitor if running
+        if hasattr(self, 'process_monitor') and self.process_monitor:
+            try:
+                self.process_monitor.stop_monitoring()
+                LOG.info("Process monitor stopped")
+            except Exception as e:
+                LOG.error(f"Error stopping process monitor: {e}")
+        
+        # Clean up database processes
+        self.stop_database_processes()
+        
+        # Clean up sockets
+        if hasattr(self, 'router_socket') and self.router_socket:
+            try:
+                self.router_socket.close()
+                LOG.info("Router socket closed")
+            except Exception as e:
+                LOG.error(f"Error closing router socket: {e}")
+        
+        # Clean up ZMQ context
+        if hasattr(self, 'context') and self.context:
+            try:
+                self.context.term()
+                LOG.info("ZMQ context terminated")
+            except Exception as e:
+                LOG.error(f"Error terminating ZMQ context: {e}")
 
     def run(self):
         """Run the multi-database server."""

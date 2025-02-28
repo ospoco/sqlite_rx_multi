@@ -63,6 +63,17 @@ def print_help():
                   "Default value is [bold][cyan]~/.curve")
     table.add_row("-k --key-id [cyan]CURVE KEY ID",
                   "Server's Curve Key ID")
+    table.add_row("--data-directory [cyan]PATH",
+                  "Base directory for database files (if using relative paths)")
+    table.add_row("--auto-connect/--no-auto-connect",
+                  "Enable/Disable automatic connection to existing databases\n"
+                  "Default value is [bold][cyan]False")
+    table.add_row("--auto-create/--no-auto-create",
+                  "Enable/Disable automatic creation of new databases\n"
+                  "Default value is [bold][cyan]False")
+    table.add_row("--max-connections [cyan]NUMBER",
+                  "Maximum number of dynamic database connections\n"
+                  "Default value is [bold][cyan]20")
     table.add_row("--help", "Show this message and exit.")
     console.print(table)
 
@@ -141,6 +152,19 @@ def handle_help(ctx: click.Context,
               type=click.Path(file_okay=False),
               help='Base directory for database files (if using relative paths)',
               default=None)
+@click.option('--auto-connect/--no-auto-connect',
+              help='Whether to automatically connect to existing databases',
+              default=False,
+              show_default=True)
+@click.option('--auto-create/--no-auto-create',
+              help='Whether to automatically create new databases',
+              default=False,
+              show_default=True)
+@click.option('--max-connections',
+              type=click.INT,
+              help='Maximum number of dynamic database connections',
+              default=20,
+              show_default=True)
 @click.option("--help",
               is_flag=True,
               is_eager=True,
@@ -158,7 +182,10 @@ def main(log_level,
          curvezmq,
          curve_dir,
          key_id,
-         data_directory):
+         data_directory,
+         auto_connect,
+         auto_create,
+         max_connections):
     logging.config.dictConfig(get_default_logger_settings(level=log_level))
     LOG.info("Python Platform %s", platform.python_implementation())
     
@@ -185,7 +212,10 @@ def main(log_level,
         'use_zap_auth': zap,
         'use_encryption': curvezmq,
         'server_curve_id': key_id,
-        'data_directory': data_directory
+        'data_directory': data_directory,
+        'auto_connect': auto_connect,
+        'auto_create': auto_create,
+        'max_connections': max_connections
     }
     LOG.info('Args %s', pformat(kwargs))
     
@@ -204,6 +234,11 @@ def main(log_level,
         print(f"Backups enabled: {backup_dir} (every {backup_interval} seconds)")
     else:
         print("Backups disabled")
+    
+    print(f"Auto-connect: {'Enabled' if auto_connect else 'Disabled'}")
+    if auto_connect:
+        print(f"Auto-create: {'Enabled' if auto_create else 'Disabled'}")
+        print(f"Max dynamic connections: {max_connections}")
     
     print("\nPress Ctrl+C to stop the server.")
     
