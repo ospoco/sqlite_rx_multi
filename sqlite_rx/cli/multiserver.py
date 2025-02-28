@@ -137,6 +137,10 @@ def handle_help(ctx: click.Context,
               type=click.STRING,
               help='Server key ID',
               default=None)
+@click.option('--data-directory',
+              type=click.Path(file_okay=False),
+              help='Base directory for database files (if using relative paths)',
+              default=None)
 @click.option("--help",
               is_flag=True,
               is_eager=True,
@@ -153,7 +157,8 @@ def main(log_level,
          zap,
          curvezmq,
          curve_dir,
-         key_id):
+         key_id,
+         data_directory):
     logging.config.dictConfig(get_default_logger_settings(level=log_level))
     LOG.info("Python Platform %s", platform.python_implementation())
     
@@ -180,6 +185,7 @@ def main(log_level,
         'use_zap_auth': zap,
         'use_encryption': curvezmq,
         'server_curve_id': key_id,
+        'data_directory': data_directory
     }
     LOG.info('Args %s', pformat(kwargs))
     
@@ -190,10 +196,15 @@ def main(log_level,
     print(f"Default database: {default_database}")
     print(f"Database map: {database_map_dict}")
     print(f"Base port for database processes: {base_port}")
+    
+    if data_directory:
+        print(f"Data directory: {data_directory}")
+    
     if backup_dir:
         print(f"Backups enabled: {backup_dir} (every {backup_interval} seconds)")
     else:
         print("Backups disabled")
+    
     print("\nPress Ctrl+C to stop the server.")
     
     try:

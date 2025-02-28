@@ -4,7 +4,10 @@ import signal
 import socket
 import time
 import uuid
+import platform
 from typing import Dict, List, Union, Optional
+from datetime import datetime
+from pathlib import Path
 
 import billiard as multiprocessing  # Using billiard for better process management
 import msgpack
@@ -14,6 +17,7 @@ from sqlite_rx import get_version
 from sqlite_rx.auth import KeyMonkey
 from sqlite_rx.exception import SQLiteRxZAPSetupError
 from sqlite_rx.server import SQLiteServer
+from sqlite_rx.utils.path_utils import resolve_database_path
 
 LOG = logging.getLogger(__name__)
 
@@ -22,15 +26,16 @@ class DatabaseProcess:
     
     def __init__(self, 
                  database_name: str,
-                 database_path: Union[bytes, str],
+                 database_path: Union[bytes, str, Path],
                  bind_port: int,
                  auth_config: dict = None,
                  use_encryption: bool = False,
                  use_zap_auth: bool = False,
                  curve_dir: str = None,
                  server_curve_id: str = None,
-                 backup_database: str = None,
-                 backup_interval: int = 600):
+                 backup_database: Union[str, Path] = None,
+                 backup_interval: int = 600,
+                 data_directory: Union[str, Path] = None):
         """
         Initialize a database process configuration.
         
@@ -45,6 +50,7 @@ class DatabaseProcess:
             server_curve_id: Server's curve key ID
             backup_database: Path to backup database
             backup_interval: Backup interval in seconds
+            data_directory: Base directory for database files
         """
         self.database_name = database_name
         self.database_path = database_path
@@ -59,6 +65,10 @@ class DatabaseProcess:
         self.server_curve_id = server_curve_id
         self.backup_database = backup_database
         self.backup_interval = backup_interval
+        self.restart_count = 0
+        self.start_time = time.time()
+        self.last_start_time = None
+        self.data_directory = data_directory
         
 
     def start(self):
@@ -77,7 +87,8 @@ class DatabaseProcess:
             curve_dir=self.curve_dir,
             server_curve_id=self.server_curve_id,
             backup_database=self.backup_database,
-            backup_interval=self.backup_interval
+            backup_interval=self.backup_interval,
+            data_directory=self.data_directory  # Pass data_directory
         )
         
         # Set the name directly instead
@@ -86,6 +97,7 @@ class DatabaseProcess:
         server.start()
         self.process = server
         self.process_id = server.pid
+        self.last_start_time = time.time()
         LOG.info(f"Started database process for '{self.database_name}' on {self.bind_address} with PID {self.process_id}")
         
     def stop(self):
@@ -118,24 +130,31 @@ class DatabaseProcess:
     def is_running(self):
         """Check if the database process is running."""
         return self.process is not None and self.process.is_alive()
+        
+    def get_uptime(self):
+        """Get the uptime of the current process instance."""
+        if self.is_running() and self.last_start_time:
+            return time.time() - self.last_start_time
+        return 0
 
 
 class SQLiteMultiServer(multiprocessing.Process):
     """A ZeroMQ ROUTER socket server that routes SQLite requests to separate database processes."""
 
     def __init__(self,
-                 bind_address: str,
-                 default_database: Union[bytes, str],
-                 database_map: Dict[str, Union[bytes, str]] = None,
-                 auth_config: dict = None,
-                 curve_dir: str = None,
-                 server_curve_id: str = None,
-                 use_encryption: bool = False,
-                 use_zap_auth: bool = False,
-                 backup_dir: str = None,
-                 backup_interval: int = 600,
-                 base_port: int = 6000,
-                 *args, **kwargs):
+                bind_address: str,
+                default_database: Union[bytes, str, Path],
+                database_map: Dict[str, Union[bytes, str, Path]] = None,
+                auth_config: dict = None,
+                curve_dir: str = None,
+                server_curve_id: str = None,
+                use_encryption: bool = False,
+                use_zap_auth: bool = False,
+                backup_dir: str = None,
+                backup_interval: int = 600,
+                base_port: int = 6000,
+                data_directory: Union[str, Path] = None,
+                *args, **kwargs):
         """
         SQLiteMultiServer starts separate processes for each database.
 
@@ -151,11 +170,21 @@ class SQLiteMultiServer(multiprocessing.Process):
             backup_dir: Directory for database backups
             backup_interval: Backup interval in seconds
             base_port: Starting port for database processes
+            data_directory: Base directory for database files (if relative paths are used)
         """
         super(SQLiteMultiServer, self).__init__(*args, **kwargs)
         self._bind_address = bind_address
-        self._default_database = default_database
-        self._database_map = database_map or {}
+        self._data_directory = data_directory
+        
+        # Store the original database paths (for passing to child processes)
+        self._default_database_orig = default_database
+        self._database_map_orig = database_map or {}
+        
+        # Resolve the database paths for local use
+        self._default_database = resolve_database_path(default_database, data_directory)
+        self._database_map = {k: resolve_database_path(v, data_directory) 
+                            for k, v in (database_map or {}).items()}
+        
         self._auth_config = auth_config
         self._encrypt = use_encryption
         self._zap_auth = use_zap_auth
@@ -173,16 +202,26 @@ class SQLiteMultiServer(multiprocessing.Process):
         self.poller = None
         self.running = False
         
+        # Initialize health metrics
+        self._start_time = time.time()
+        self._health_metrics = {
+            "query_count": 0,
+            "error_count": 0,
+            "last_query_time": 0,
+            "total_process_restarts": 0,
+        }
+        self.name = kwargs.pop('name', f"SQLiteMultiServer-{os.getpid()}")
+        
     def setup_database_processes(self):
         """Set up all database processes."""
         # Start with the default database
         default_backup = None
         if self.backup_dir:
             default_backup = os.path.join(self.backup_dir, "default_backup.db")
-            
+                
         default_process = DatabaseProcess(
             database_name="",
-            database_path=self._default_database,
+            database_path=self._default_database_orig,  # Pass original path
             bind_port=self.base_port,
             auth_config=self._auth_config,
             use_encryption=self._encrypt,
@@ -190,20 +229,21 @@ class SQLiteMultiServer(multiprocessing.Process):
             curve_dir=self.curve_dir,
             server_curve_id=self.server_curve_id,
             backup_database=default_backup,
-            backup_interval=self.backup_interval
+            backup_interval=self.backup_interval,
+            data_directory=self._data_directory  # Pass data_directory
         )
         self.database_processes[""] = default_process
         
         # Now set up each named database
         port = self.base_port + 1
-        for db_name, db_path in self._database_map.items():
+        for db_name, db_path in self._database_map_orig.items():  # Use original paths
             backup_path = None
             if self.backup_dir:
                 backup_path = os.path.join(self.backup_dir, f"{db_name}_backup.db")
-                
+                    
             db_process = DatabaseProcess(
                 database_name=db_name,
-                database_path=db_path,
+                database_path=db_path,  # Pass original path
                 bind_port=port,
                 auth_config=self._auth_config,
                 use_encryption=self._encrypt,
@@ -211,7 +251,8 @@ class SQLiteMultiServer(multiprocessing.Process):
                 curve_dir=self.curve_dir,
                 server_curve_id=self.server_curve_id,
                 backup_database=backup_path,
-                backup_interval=self.backup_interval
+                backup_interval=self.backup_interval,
+                data_directory=self._data_directory  # Pass data_directory
             )
             self.database_processes[db_name] = db_process
             port += 1
@@ -296,6 +337,22 @@ class SQLiteMultiServer(multiprocessing.Process):
             # Store the mapping between identity and database name for responses
             self.identity_db_map[identity] = database_name
             
+            # Check for health check command
+            if unpacked_message.get('query') == 'HEALTH_CHECK':
+                LOG.debug("Received HEALTH_CHECK request for database %s", database_name or "default")
+                
+                # Generate health info
+                health_info = self.get_health_info(database_name)
+                
+                # Send health info response
+                compressed_result = zlib.compress(msgpack.dumps(health_info))
+                self.router_socket.send_multipart([identity, empty_delimiter, compressed_result])
+                return
+            
+            # Update metrics for regular queries
+            self._health_metrics["query_count"] += 1
+            self._health_metrics["last_query_time"] = time.time()
+            
             # Check if we have a process for this database
             if database_name in self.database_processes:
                 db_process = self.database_processes[database_name]
@@ -312,6 +369,9 @@ class SQLiteMultiServer(multiprocessing.Process):
                     db_process.start()
                     LOG.info(f"Started new process for database '{database_name or 'default'}'")
                     
+                    # Update restart metrics
+                    self._health_metrics["total_process_restarts"] += 1
+                    
                     # Give it time to initialize
                     time.sleep(1.0)  # Increased delay to ensure the process is ready
                     
@@ -320,6 +380,9 @@ class SQLiteMultiServer(multiprocessing.Process):
                         LOG.error(f"Failed to restart database process for '{database_name or 'default'}'")
                         self._send_error_response(identity, empty_delimiter, 
                                                 f"Unable to restart database process for '{database_name}'")
+                        
+                        # Update error metrics
+                        self._health_metrics["error_count"] += 1
                         return
                 
                 # Forward the request to the database process
@@ -351,6 +414,9 @@ class SQLiteMultiServer(multiprocessing.Process):
                         LOG.warning(f"Timeout waiting for response from database '{database_name or 'default'}'")
                         self._send_error_response(identity, empty_delimiter, 
                                                 f"Timeout waiting for response from database '{database_name}'")
+                        
+                        # Update error metrics
+                        self._health_metrics["error_count"] += 1
                     
                     # Clean up the temporary socket
                     poller.unregister(dealer_socket)
@@ -361,14 +427,23 @@ class SQLiteMultiServer(multiprocessing.Process):
                     self._send_error_response(identity, empty_delimiter, 
                                             f"Error communicating with database '{database_name}': {str(e)}")
                     
+                    # Update error metrics
+                    self._health_metrics["error_count"] += 1
+                    
             else:
                 # We don't have a process for this database
                 LOG.warning(f"Database '{database_name}' not found")
                 self._send_error_response(identity, empty_delimiter, f"Database '{database_name}' not found")
                 
+                # Update error metrics
+                self._health_metrics["error_count"] += 1
+                
         except Exception as e:
             LOG.exception(f"Error processing client request: {e}")
             self._send_error_response(identity, empty_delimiter, f"Error processing request: {str(e)}")
+            
+            # Update error metrics
+            self._health_metrics["error_count"] += 1
 
     def _send_error_response(self, identity, empty_delimiter, error_message):
         """Helper method to send an error response to the client."""
@@ -401,6 +476,93 @@ class SQLiteMultiServer(multiprocessing.Process):
         
         raise SystemExit()
 
+    def get_health_info(self, database_name=''):
+        """
+        Generate health information for the multi-server.
+        
+        Args:
+            database_name: Optional database name to get specific health info
+            
+        Returns:
+            Dict containing health information
+        """
+        from sqlite_rx import get_version
+        
+        # Basic health information
+        health_info = {
+            "status": "healthy",
+            "timestamp": time.time(),
+            "uptime": time.time() - self._start_time,
+            "version": get_version(),
+            "platform": platform.python_implementation(),
+            "server_type": "SQLiteMultiServer",
+            "server_name": self.name,
+            "server_pid": self.pid,
+            "database_name": database_name,
+            "query_count": self._health_metrics["query_count"],
+            "error_count": self._health_metrics["error_count"],
+            "last_query_time": self._health_metrics["last_query_time"],
+            "total_process_restarts": self._health_metrics["total_process_restarts"],
+        }
+        
+        # Add data directory info
+        if self._data_directory:
+            health_info["data_directory"] = str(self._data_directory)
+        
+        # Get info about all database processes
+        processes_info = {}
+        for db_name, db_process in self.database_processes.items():
+            process_info = {
+                "running": db_process.is_running(),
+                "pid": db_process.process_id if db_process.process_id else None,
+                "port": db_process.bind_port,
+                "address": db_process.bind_address,
+            }
+            
+            # Add restart count if available
+            restart_count = getattr(db_process, 'restart_count', 0)
+            process_info["restart_count"] = restart_count
+            
+            # Add database path
+            if hasattr(db_process, 'database_path'):
+                process_info["database_path"] = str(db_process.database_path)
+                if str(db_process.database_path) == ":memory:":
+                    process_info["memory_database"] = True
+                else:
+                    process_info["memory_database"] = False
+            
+            processes_info[db_name or "default"] = process_info
+        
+        health_info["processes"] = processes_info
+        health_info["database_count"] = len(processes_info)
+        
+        # Specific information about requested database
+        if database_name in self.database_processes:
+            db_process = self.database_processes[database_name]
+            health_info["database_status"] = "running" if db_process.is_running() else "not_running"
+            
+            # Add more specific info about the requested database
+            if db_process.is_running():
+                # Add information about this specific database
+                health_info["database_bind_address"] = db_process.bind_address
+                health_info["database_pid"] = db_process.process_id
+                
+                # Backup info
+                if hasattr(db_process, 'backup_database') and db_process.backup_database:
+                    health_info["database_backup_enabled"] = True
+                    health_info["database_backup_path"] = str(db_process.backup_database)
+                    health_info["database_backup_interval"] = db_process.backup_interval
+                else:
+                    health_info["database_backup_enabled"] = False
+        else:
+            if database_name:  # Only mark unknown if a specific database was requested
+                health_info["database_status"] = "unknown"
+                health_info["database_error"] = f"Database '{database_name}' not found"
+            else:
+                health_info["database_status"] = "default"
+        
+        return health_info
+
     def check_database_processes(self):
         """Check all database processes and restart any that have died."""
         for db_name, db_process in self.database_processes.items():
@@ -414,6 +576,13 @@ class SQLiteMultiServer(multiprocessing.Process):
                 # Start a new process
                 db_process.start()
                 LOG.info(f"Started new process for database '{db_name or 'default'}'")
+                
+                # Update restart metrics
+                self._health_metrics["total_process_restarts"] += 1
+                if hasattr(db_process, 'restart_count'):
+                    db_process.restart_count = getattr(db_process, 'restart_count', 0) + 1
+                else:
+                    db_process.restart_count = 1
                 
                 # Give it time to initialize
                 time.sleep(0.5)

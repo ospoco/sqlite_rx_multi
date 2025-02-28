@@ -8,6 +8,8 @@ sqlite_rx.egg-info/
 cover/
 build/
 dist/
+bin/
+data/
 .coverage
 .pytest_cache
 .coverage

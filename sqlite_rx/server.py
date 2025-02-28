@@ -9,6 +9,7 @@ import traceback
 import zlib
 import time
 import signal as signal_module 
+from datetime import datetime
 
 from typing import List, Union, Callable
 
@@ -121,24 +122,39 @@ class SQLiteZMQProcess(multiprocessing.Process):
 
 
 class SQLiteServer(SQLiteZMQProcess):
-
     def __init__(self,
                 bind_address: str,
-                database: Union[bytes, str],
+                database: Union[bytes, str, Path],
                 auth_config: dict = None,
                 curve_dir: str = None,
                 server_curve_id: str = None,
                 use_encryption: bool = False,
                 use_zap_auth: bool = False,
-                backup_database: Union[bytes, str] = None,
+                backup_database: Union[bytes, str, Path] = None,
                 backup_interval: int = 4,
+                data_directory: Union[str, Path] = None,
                 *args, **kwargs):
         """
         SQLiteServer runs as an isolated python process.
+        
+        Args:
+            bind_address: Address on which to listen
+            database: Path to the database file or ":memory:"
+            auth_config: Authorization configuration
+            curve_dir: Directory containing curve keys
+            server_curve_id: Server's curve ID
+            use_encryption: Whether to use encryption
+            use_zap_auth: Whether to use ZAP authentication
+            backup_database: Path to backup database
+            backup_interval: Backup interval in seconds
+            data_directory: Base directory for database files (if relative paths are used)
         """
         super(SQLiteServer, self).__init__(*args, **kwargs)
         self._bind_address = bind_address
-        self._database = database
+        self._data_directory = data_directory
+        
+        # Resolve database path
+        self._database = resolve_database_path(database, data_directory)
         self._auth_config = auth_config
         self._encrypt = use_encryption
         self._zap_auth = use_zap_auth
@@ -146,15 +162,26 @@ class SQLiteServer(SQLiteZMQProcess):
         self.curve_dir = curve_dir
         self.rep_stream = None
         self.back_up_recurring_thread = None
-        # Store backup parameters as instance variables
-        self._backup_database = backup_database
+        
+        # Resolve backup database path
+        self._backup_database = resolve_database_path(backup_database, data_directory) if backup_database else None
         self._backup_interval = backup_interval
 
-        if backup_database is not None:
+        if self._backup_database is not None:
             if not is_backup_supported():
                 raise SQLiteRxBackUpError(f"SQLite backup is not supported on {sys.platform} or {platform.python_implementation()}")
 
-            sqlite_backup = SQLiteBackUp(src=database, target=backup_database)
+            # Create parent directory for backup if it doesn't exist
+            if isinstance(self._backup_database, (str, bytes)) and self._backup_database != ":memory:":
+                try:
+                    backup_dir = os.path.dirname(str(self._backup_database))
+                    if backup_dir and not os.path.exists(backup_dir):
+                        LOG.info(f"Creating backup directory: {backup_dir}")
+                        os.makedirs(backup_dir, exist_ok=True)
+                except Exception as e:
+                    LOG.warning(f"Failed to create backup directory: {e}")
+
+            sqlite_backup = SQLiteBackUp(src=self._database, target=self._backup_database)
             self.back_up_recurring_thread = RecurringTimer(function=sqlite_backup, interval=backup_interval)
             self.back_up_recurring_thread.daemon = True
 
@@ -163,6 +190,15 @@ class SQLiteServer(SQLiteZMQProcess):
             self.context = zmq.Context.instance()
         else:
             self.context = None  # Will be set in setup()
+            
+        # Initialize health metrics
+        self._start_time = time.time()
+        self._health_metrics = {
+            "query_count": 0,
+            "error_count": 0,
+            "last_query_time": 0,
+        }
+        self.name = kwargs.pop('name', f"SQLiteServer-{os.getpid()}")
 
     def setup(self):
         """
@@ -178,15 +214,18 @@ class SQLiteServer(SQLiteZMQProcess):
             self.context = zmq.Context.instance()
         # Depending on the initialization parameters either get a plain stream or secure stream.
         self.rep_stream = self.stream(zmq.REP,
-                                      self._bind_address,
-                                      use_encryption=self._encrypt,
-                                      use_zap=self._zap_auth,
-                                      server_curve_id=self.server_curve_id,
-                                      curve_dir=self.curve_dir)
-        # Register the callback.
-        self.rep_stream.on_recv(QueryStreamHandler(self.rep_stream,
-                                                   self._database,
-                                                   self._auth_config))
+                                    self._bind_address,
+                                    use_encryption=self._encrypt,
+                                    use_zap=self._zap_auth,
+                                    server_curve_id=self.server_curve_id,
+                                    curve_dir=self.curve_dir)
+        # Register the callback with reference to self
+        self.rep_stream.on_recv(QueryStreamHandler(
+            self.rep_stream,
+            self._database,
+            self._auth_config,
+            server=self  # Pass reference to server
+        ))
 
     def handle_signal(self, signum, frame):
         LOG.info("SQLiteServer %s PID %s received %r", self, self.pid, signum)
@@ -307,11 +346,11 @@ class SQLiteServer(SQLiteZMQProcess):
                 LOG.warning("Error terminating ZMQ context: %s", e)
 
 class QueryStreamHandler:
-
     def __init__(self,
                  rep_stream,
                  database: Union[bytes, str],
-                 auth_config: dict = None):
+                 auth_config: dict = None,
+                 server = None):
         """
         Executes SQL queries and send results back on the `zmq.REP` stream
 
@@ -319,7 +358,7 @@ class QueryStreamHandler:
              rep_stream: The zmq.REP socket stream on which to send replies.
              database: A path like object or the string ":memory:" for in-memory database.
              auth_config: A dictionary describing what actions are authorized, denied or ignored.
-
+             server: Reference to the parent server instance.
         """
         self._connection = sqlite3.connect(database=database,
                                            isolation_level=None,
@@ -328,6 +367,13 @@ class QueryStreamHandler:
         self._connection.set_authorizer(Authorizer(config=auth_config))
         self._cursor = self._connection.cursor()
         self._rep_stream = rep_stream
+        self._server = server
+        self._start_time = time.time()
+        
+        # Local metrics (to be used if server reference not available)
+        self._query_count = 0
+        self._error_count = 0
+        self._last_query_time = 0
 
     @staticmethod
     def capture_exception():
@@ -340,12 +386,35 @@ class QueryStreamHandler:
         try:
             message = message[-1]
             message = msgpack.loads(zlib.decompress(message), raw=False)
+            
+            # Check for health check command
+            if isinstance(message, dict) and message.get('query') == 'HEALTH_CHECK':
+                self._rep_stream.send(self.get_health_check_response())
+                return
+                
+            # Update metrics before processing query
+            self._query_count += 1
+            self._last_query_time = time.time()
+            
+            # Update server metrics if available
+            if self._server and hasattr(self._server, '_health_metrics'):
+                self._server._health_metrics["query_count"] += 1
+                self._server._health_metrics["last_query_time"] = time.time()
+                
             self._rep_stream.send(self.execute(message))
         except Exception:
             LOG.exception("exception while preparing response")
             error = self.capture_exception()
+            
+            # Update error metrics
+            self._error_count += 1
+            
+            # Update server error metrics if available
+            if self._server and hasattr(self._server, '_health_metrics'):
+                self._server._health_metrics["error_count"] += 1
+                
             result = {"items": [],
-                      "error": error}
+                    "error": error}
             self._rep_stream.send(zlib.compress(msgpack.dumps(result)))
 
     def execute(self, message: dict, *args, **kwargs):
@@ -393,3 +462,64 @@ class QueryStreamHandler:
             LOG.exception("Exception while collecting rows")
             result['error'] = self.capture_exception()
             return zlib.compress(msgpack.dumps(result))
+
+    def get_health_check_response(self):
+        """Generate a response for the HEALTH_CHECK command."""
+        from sqlite_rx import get_version
+        
+        # Basic health info
+        health_info = {
+            "status": "healthy",
+            "timestamp": time.time(),
+            "uptime": time.time() - self._start_time,
+            "version": get_version(),
+            "platform": platform.python_implementation(),
+            "query_count": self._query_count,
+            "error_count": self._error_count,
+            "last_query_time": self._last_query_time,
+        }
+        
+        # Add server metrics if available
+        if self._server:
+            if hasattr(self._server, '_start_time'):
+                health_info["server_uptime"] = time.time() - self._server._start_time
+            
+            if hasattr(self._server, '_health_metrics'):
+                health_info.update(self._server._health_metrics)
+                
+            if hasattr(self._server, 'name'):
+                health_info["server_name"] = self._server.name
+                
+            if hasattr(self._server, 'pid'):
+                health_info["server_pid"] = self._server.pid
+                
+            # Add data directory information
+            if hasattr(self._server, '_data_directory') and self._server._data_directory:
+                health_info["data_directory"] = str(self._server._data_directory)
+        
+        # Check if database is responsive
+        try:
+            self._cursor.execute("SELECT 1")
+            health_info["database_status"] = "connected"
+        except Exception as e:
+            health_info["database_status"] = "error"
+            health_info["database_error"] = str(e)
+        
+        # Check backup status if applicable
+        if self._server and hasattr(self._server, 'back_up_recurring_thread'):
+            backup_thread = self._server.back_up_recurring_thread
+            if backup_thread:
+                health_info["backup_enabled"] = True
+                health_info["backup_thread_alive"] = backup_thread.is_alive()
+                health_info["backup_interval"] = getattr(self._server, '_backup_interval', 0)
+            else:
+                health_info["backup_enabled"] = False
+        
+        # Add memory database info
+        if isinstance(self._server._database, str) and self._server._database == ":memory:":
+            health_info["memory_database"] = True
+        else:
+            health_info["memory_database"] = False
+            health_info["database_path"] = str(self._server._database)
+        
+        return zlib.compress(msgpack.dumps(health_info))
