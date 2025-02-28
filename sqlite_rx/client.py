@@ -7,8 +7,8 @@ import time
 
 import msgpack
 import zmq
-from sqlite_rx.auth import KeyMonkey
-from sqlite_rx.exception import (
+from .auth import KeyMonkey
+from .exception import (
     SQLiteRxCompressionError,
     SQLiteRxConnectionError,
     SQLiteRxTransportError,

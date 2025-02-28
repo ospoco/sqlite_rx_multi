@@ -13,11 +13,11 @@ import billiard as multiprocessing  # Using billiard for better process manageme
 import msgpack
 import zmq
 import zlib
-from sqlite_rx import get_version
-from sqlite_rx.auth import KeyMonkey
-from sqlite_rx.exception import SQLiteRxZAPSetupError
-from sqlite_rx.server import SQLiteServer
-from sqlite_rx.utils.path_utils import resolve_database_path
+from . import get_version
+from .auth import KeyMonkey
+from .exception import SQLiteRxZAPSetupError
+from .server import SQLiteServer
+from .utils.path_utils import resolve_database_path
 
 LOG = logging.getLogger(__name__)
 

@@ -10,17 +10,18 @@ import zlib
 import time
 import signal as signal_module 
 from datetime import datetime
+from pathlib import Path
 
 from typing import List, Union, Callable
 
 import billiard as multiprocessing
 import msgpack
 import zmq
-from sqlite_rx import get_version
-from sqlite_rx.auth import Authorizer, KeyMonkey
-from sqlite_rx.backup import SQLiteBackUp, RecurringTimer, is_backup_supported
-from sqlite_rx.exception import SQLiteRxBackUpError
-from sqlite_rx.exception import SQLiteRxZAPSetupError
+from . import get_version
+from .auth import Authorizer, KeyMonkey
+from .backup import SQLiteBackUp, RecurringTimer, is_backup_supported
+from .exception import SQLiteRxBackUpError, SQLiteRxZAPSetupError
+from .utils.path_utils import resolve_database_path
 from tornado import ioloop, version
 from zmq.auth.asyncio import AsyncioAuthenticator
 from zmq.eventloop import zmqstream
